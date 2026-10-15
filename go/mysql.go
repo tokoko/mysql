@@ -573,6 +573,20 @@ func (s *mysqlStatement) SetOption(ctx context.Context, key, value string) error
 	}
 }
 
+// SetSubstraitPlan translates the plan to MySQL SQL and sets it as the query.
+// See substrait.go for the supported subset of Substrait.
+func (s *mysqlStatement) SetSubstraitPlan(ctx context.Context, plan []byte) error {
+	query, err := translateSubstraitPlan(plan)
+	if err != nil {
+		var se *substraitError
+		if errors.As(err, &se) {
+			return s.Base().ErrorHelper.Errorf(se.code, "%s", se.msg)
+		}
+		return err
+	}
+	return s.SetSqlQuery(ctx, query)
+}
+
 // infoSqlIdentifierQuoteChar is the Flight SQL GetSqlInfo code for
 // SQL_IDENTIFIER_QUOTE_CHAR, in the [500, 1000) XDBC range reserved by ADBC.
 const infoSqlIdentifierQuoteChar = 504
@@ -588,7 +602,7 @@ func NewDriver(alloc memory.Allocator) driverbase.DriverWithContext {
 	driver.DriverInfo.MustRegister(map[adbc.InfoCode]any{
 		adbc.InfoDriverName:                       "ADBC Driver Foundry Driver for MySQL",
 		adbc.InfoVendorSql:                        true,
-		adbc.InfoVendorSubstrait:                  false,
+		adbc.InfoVendorSubstrait:                  true,
 		adbc.InfoCode(infoSqlIdentifierQuoteChar): "`",
 	})
 	return driver

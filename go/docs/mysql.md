@@ -108,6 +108,15 @@ Examples:
 
 MySQL only has databases. The driver treats MySQL databases as catalogs and leaves schemas empty. To explicitly specify the database name when querying the catalog, bulk ingesting, or in other operations, pass it as the ADBC catalog.
 
+### Substrait Support
+
+Statements accept serialized Substrait plans, which the driver translates into MySQL SQL. Only a subset of Substrait is supported:
+
+- Relations: `ReadRel` over a named table (`[table]` or `[database, table]`, with optional filter and projection), `FilterRel`, and `FetchRel` (LIMIT/OFFSET, with literal values only).
+- Expressions: field references, literals, `IN` lists, `CASE`, `CAST`, and common scalar functions (comparison, boolean, arithmetic, `like`, and basic string and math functions).
+
+Plans using anything else are rejected with `ADBC_STATUS_NOT_IMPLEMENTED`.
+
 ### Types
 
 {{ types|safe }}

@@ -25,6 +25,8 @@ require (
 	github.com/go-ext/variant v1.2.4
 	github.com/go-sql-driver/mysql v1.10.1
 	github.com/stretchr/testify v1.12.1
+	github.com/substrait-io/substrait-protobuf/go v0.85.0
+	google.golang.org/protobuf v1.36.12
 )
 
 require (
@@ -66,5 +68,4 @@ require (
 	google.golang.org/genproto/googleapis/api v0.0.0-20260831171406-18b4a7587f8a // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260831171406-18b4a7587f8a // indirect
 	google.golang.org/grpc v1.83.2 // indirect
-	google.golang.org/protobuf v1.36.12 // indirect
 )

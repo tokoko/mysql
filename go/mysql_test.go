@@ -36,6 +36,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+	"github.com/substrait-io/substrait-protobuf/go/substraitpb"
+	substraitext "github.com/substrait-io/substrait-protobuf/go/substraitpb/extensions"
+	"google.golang.org/protobuf/proto"
 
 	mysql "github.com/adbc-drivers/mysql"
 )
@@ -271,7 +274,7 @@ func (q *MySQLQuirks) GetMetadata(code adbc.InfoCode) any {
 	case adbc.InfoVendorSql:
 		return true
 	case adbc.InfoVendorSubstrait:
-		return false
+		return true
 	case adbc.InfoCode(504): // SQL_IDENTIFIER_QUOTE_CHAR
 		return "`"
 	}
@@ -967,6 +970,107 @@ func (s *MySQLTestSuite) TestZeroDatetimeBehaviorQuery() {
 
 	s.False(rdr.Next())
 	s.NoError(rdr.Err())
+}
+
+func (s *MySQLTestSuite) TestSubstraitPlan() {
+	for _, query := range []string{
+		"DROP TABLE IF EXISTS substrait_people",
+		"CREATE TABLE substrait_people (id INT, name VARCHAR(32), age INT)",
+		`INSERT INTO substrait_people VALUES (1, 'ann', 17), (2, 'bob', 30), (3, 'a\\b', 41), (4, 'dan', 52), (5, 'eve', NULL)`,
+	} {
+		s.Require().NoError(s.stmt.SetSqlQuery(s.ctx, query))
+		_, err := s.stmt.ExecuteUpdate(s.ctx)
+		s.Require().NoError(err)
+	}
+
+	field := func(i int32) *substraitpb.Expression {
+		return &substraitpb.Expression{RexType: &substraitpb.Expression_Selection{Selection: &substraitpb.Expression_FieldReference{
+			ReferenceType: &substraitpb.Expression_FieldReference_DirectReference{DirectReference: &substraitpb.Expression_ReferenceSegment{
+				ReferenceType: &substraitpb.Expression_ReferenceSegment_StructField_{StructField: &substraitpb.Expression_ReferenceSegment_StructField{Field: i}},
+			}},
+		}}}
+	}
+	i64 := func(v int64) *substraitpb.Expression {
+		return &substraitpb.Expression{RexType: &substraitpb.Expression_Literal_{Literal: &substraitpb.Expression_Literal{
+			LiteralType: &substraitpb.Expression_Literal_I64{I64: v},
+		}}}
+	}
+	call := func(anchor uint32, args ...*substraitpb.Expression) *substraitpb.Expression {
+		fargs := make([]*substraitpb.FunctionArgument, len(args))
+		for i, a := range args {
+			fargs[i] = &substraitpb.FunctionArgument{ArgType: &substraitpb.FunctionArgument_Value{Value: a}}
+		}
+		return &substraitpb.Expression{RexType: &substraitpb.Expression_ScalarFunction_{ScalarFunction: &substraitpb.Expression_ScalarFunction{
+			FunctionReference: anchor, Arguments: fargs,
+		}}}
+	}
+	i32 := &substraitpb.Type{Kind: &substraitpb.Type_I32_{I32: &substraitpb.Type_I32{}}}
+	str := &substraitpb.Type{Kind: &substraitpb.Type_String_{String_: &substraitpb.Type_String{}}}
+
+	// SELECT name, id FROM substrait_people WHERE age > 18 LIMIT 2 OFFSET 1
+	plan := &substraitpb.Plan{
+		Extensions: []*substraitext.SimpleExtensionDeclaration{{
+			MappingType: &substraitext.SimpleExtensionDeclaration_ExtensionFunction_{
+				ExtensionFunction: &substraitext.SimpleExtensionDeclaration_ExtensionFunction{FunctionAnchor: 1, Name: "gt:i32_i32"},
+			},
+		}},
+		Relations: []*substraitpb.PlanRel{{RelType: &substraitpb.PlanRel_Root{Root: &substraitpb.RelRoot{
+			Names: []string{"who", "key"},
+			Input: &substraitpb.Rel{RelType: &substraitpb.Rel_Fetch{Fetch: &substraitpb.FetchRel{
+				OffsetMode: &substraitpb.FetchRel_OffsetExpr{OffsetExpr: i64(1)},
+				CountMode:  &substraitpb.FetchRel_CountExpr{CountExpr: i64(2)},
+				Input: &substraitpb.Rel{RelType: &substraitpb.Rel_Filter{Filter: &substraitpb.FilterRel{
+					Condition: call(1, field(2), i64(18)),
+					Input: &substraitpb.Rel{RelType: &substraitpb.Rel_Read{Read: &substraitpb.ReadRel{
+						Common: &substraitpb.RelCommon{EmitKind: &substraitpb.RelCommon_Emit_{
+							Emit: &substraitpb.RelCommon_Emit{OutputMapping: []int32{1, 0, 2}},
+						}},
+						BaseSchema: &substraitpb.NamedStruct{
+							Names:  []string{"id", "name", "age"},
+							Struct: &substraitpb.Type_Struct{Types: []*substraitpb.Type{i32, str, i32}},
+						},
+						ReadType: &substraitpb.ReadRel_NamedTable_{NamedTable: &substraitpb.ReadRel_NamedTable{
+							Names: []string{"substrait_people"},
+						}},
+					}}},
+				}}},
+			}}},
+		}}}},
+	}
+	// Keep only the first two emitted columns (name, id) at the root.
+	plan.Relations[0].GetRoot().Input.GetFetch().Common = &substraitpb.RelCommon{EmitKind: &substraitpb.RelCommon_Emit_{
+		Emit: &substraitpb.RelCommon_Emit{OutputMapping: []int32{0, 1}},
+	}}
+	serialized, err := proto.Marshal(plan)
+	s.Require().NoError(err)
+
+	stmt, err := s.cnxn.NewStatement(s.ctx)
+	s.Require().NoError(err)
+	defer func() { s.NoError(stmt.Close(s.ctx)) }()
+
+	s.Require().NoError(stmt.SetSubstraitPlan(s.ctx, serialized))
+	rdr, _, err := stmt.ExecuteQuery(s.ctx)
+	s.Require().NoError(err)
+	defer rdr.Release()
+
+	s.Equal([]string{"who", "key"}, []string{rdr.Schema().Field(0).Name, rdr.Schema().Field(1).Name})
+	var names []string
+	var ids []int64
+	for rdr.Next() {
+		rec := rdr.RecordBatch()
+		for i := 0; i < int(rec.NumRows()); i++ {
+			names = append(names, rec.Column(0).ValueStr(i))
+			ids = append(ids, int64(rec.Column(1).(*array.Int32).Value(i)))
+		}
+	}
+	s.Require().NoError(rdr.Err())
+	// Rows with age > 18 are ids 2, 3, 4; MySQL returns them in insertion order.
+	s.Equal([]string{`a\b`, "dan"}, names)
+	s.Equal([]int64{3, 4}, ids)
+
+	var adbcErr adbc.Error
+	s.Require().ErrorAs(stmt.SetSubstraitPlan(s.ctx, []byte("not a plan")), &adbcErr)
+	s.Equal(adbc.StatusInvalidArgument, adbcErr.Code)
 }
 
 func TestMySQLTypeTests(t *testing.T) {
